@@ -75,8 +75,7 @@ dump_mysql() {
 }
 
 dump_pgsql() {
-    pg_dump --host="$HOST" --port="$PORT" --username="$DBUSER" \
-        --clean --create -F p "$1"
+    pg_dump "${PG_CONN[@]}" --clean --create -F p "$1"
 }
 
 dump_db() {
@@ -93,8 +92,11 @@ enumerate_databases() {
             "$CLIENT_BIN" "${MYSQL_ARGS[@]}" -N -e "SHOW DATABASES"
             ;;
         pgsql)
-            psql --host="$HOST" --port="$PORT" --username="$DBUSER" \
-                 --dbname=postgres -At \
+            local -a q=("${PG_CONN[@]}")
+            # Without a service we connect to the default maintenance db; with a
+            # service we let it choose the db (pg_database is visible from any).
+            if [[ -z "$SERVICE" ]]; then q+=(--dbname=postgres); fi
+            psql "${q[@]}" -At \
                  -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres';"
             ;;
     esac
@@ -125,6 +127,10 @@ DATABASE OPTIONS
   -P, --port <port>           default: driver default
   -u, --user <user>           default: root
   -p, --password <password>
+      --login-path <name>     mysql/mariadb: read credentials from a named
+                              mysql_config_editor login-path instead of -u/-p
+      --service <name>        pgsql: connect via a ~/.pg_service.conf service
+                              (secret in ~/.pgpass) instead of -u/-p
   -D, --databases <names>     Space-separated list, or ALL (default: ALL)
 
 STORAGE OPTIONS
@@ -145,8 +151,19 @@ GENERAL OPTIONS
       --help                  Show help
 
 ENVIRONMENT VARIABLES (CLI flags always take precedence)
-  DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES,
-  RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS, LOG_FILE
+  DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES, DB_LOGIN_PATH,
+  DB_SERVICE, RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS, LOG_FILE
+  (pgsql also honours the standard PGSERVICE variable.)
+
+CREDENTIALS
+  Like rclone remotes, credentials can live in a named store instead of flags:
+    mysql/mariadb:
+      mysql_config_editor set --login-path=prod --host=H --user=U --password
+      db-backup --login-path prod -r hetzner:my-bucket/db-backups
+    pgsql:
+      # ~/.pg_service.conf -> [prod] host=H user=U dbname=postgres
+      # ~/.pgpass (chmod 600) -> H:5432:*:U:secret
+      db-backup --driver pgsql --service prod -r hetzner:my-bucket/db-backups
 
 RESTORE
   # Stream directly into MySQL without downloading
@@ -169,6 +186,8 @@ while [[ $# -gt 0 ]]; do
         -P|--port)       need "$1" $#; CLI_PORT="$2";       shift 2 ;;
         -u|--user)       need "$1" $#; CLI_USER="$2";       shift 2 ;;
         -p|--password)   need "$1" $#; CLI_PASSWORD="$2";   shift 2 ;;
+        --login-path)    need "$1" $#; CLI_LOGIN_PATH="$2"; shift 2 ;;
+        --service)       need "$1" $#; CLI_SERVICE="$2";    shift 2 ;;
         -D|--databases)  need "$1" $#; CLI_DATABASES="$2";  shift 2 ;;
         -r|--primary)    need "$1" $#; CLI_PRIMARY="$2";    shift 2 ;;
         -R|--secondary)  need "$1" $#; CLI_SECONDARY="$2";  shift 2 ;;
@@ -201,7 +220,16 @@ HOST="${CLI_HOST:-${DB_HOST:-$DEFAULT_HOST}}"
 PORT="${CLI_PORT:-${DB_PORT:-}}"
 DBUSER="${CLI_USER:-${DB_USER:-$DEFAULT_USER}}"
 PASSWORD="${CLI_PASSWORD:-${DB_PASSWORD:-}}"
+LOGIN_PATH="${CLI_LOGIN_PATH:-${DB_LOGIN_PATH:-}}"
+SERVICE="${CLI_SERVICE:-${DB_SERVICE:-${PGSERVICE:-}}}"
 DATABASES="${CLI_DATABASES:-${DB_NAMES:-$DEFAULT_DATABASES}}"
+
+# Explicit (pre-default) connection params. In --login-path / --service mode the
+# host/port/user/password come from the credential store; these still override
+# individual fields when set.
+HOST_EXPLICIT="${CLI_HOST:-${DB_HOST:-}}"
+PORT_EXPLICIT="${CLI_PORT:-${DB_PORT:-}}"
+USER_EXPLICIT="${CLI_USER:-${DB_USER:-}}"
 PRIMARY="${CLI_PRIMARY:-${RCLONE_PRIMARY:-}}"
 SECONDARY="${CLI_SECONDARY:-${RCLONE_SECONDARY:-}}"
 RETENTION="${CLI_RETENTION:-${RETENTION_DAYS:-$DEFAULT_RETENTION}}"
@@ -222,6 +250,13 @@ if [[ -z "$PORT" ]]; then
     esac
 fi
 
+if [[ -n "$LOGIN_PATH" && "$DRIVER" == pgsql ]]; then
+    die "--login-path is only valid for mysql/mariadb (use --service for pgsql)"
+fi
+if [[ -n "$SERVICE" && "$DRIVER" != pgsql ]]; then
+    die "--service is only valid for pgsql (use --login-path for mysql/mariadb)"
+fi
+
 [[ -n "$PRIMARY" ]] || die "Missing required --primary (or RCLONE_PRIMARY)"
 [[ "$RETENTION" =~ ^[0-9]+$ ]] || die "Invalid --retention: '$RETENTION' (expected a non-negative integer)"
 
@@ -233,8 +268,36 @@ PRIMARY="${PRIMARY%/}"
 if [[ -n "$SECONDARY" ]]; then SECONDARY="${SECONDARY%/}"; fi
 
 # --- Build per-driver connection args + password env -------------------------
-MYSQL_ARGS=(--host="$HOST" --port="$PORT" --user="$DBUSER")
+# With --login-path (mysql/mariadb) or --service (pgsql) the credentials live in
+# the client's own named store (~/.mylogin.cnf, ~/.pg_service.conf + ~/.pgpass) —
+# the rclone-remote equivalent. Explicit --host/--port/--user still override.
+MYSQL_ARGS=()
+PG_CONN=()
+case "$DRIVER" in
+    mysql|mariadb)
+        if [[ -n "$LOGIN_PATH" ]]; then
+            MYSQL_ARGS+=(--login-path="$LOGIN_PATH")
+            if [[ -n "$HOST_EXPLICIT" ]]; then MYSQL_ARGS+=(--host="$HOST_EXPLICIT"); fi
+            if [[ -n "$PORT_EXPLICIT" ]]; then MYSQL_ARGS+=(--port="$PORT_EXPLICIT"); fi
+            if [[ -n "$USER_EXPLICIT" ]]; then MYSQL_ARGS+=(--user="$USER_EXPLICIT"); fi
+        else
+            MYSQL_ARGS+=(--host="$HOST" --port="$PORT" --user="$DBUSER")
+        fi
+        ;;
+    pgsql)
+        if [[ -n "$SERVICE" ]]; then
+            export PGSERVICE="$SERVICE"
+            if [[ -n "$HOST_EXPLICIT" ]]; then PG_CONN+=(--host="$HOST_EXPLICIT"); fi
+            if [[ -n "$PORT_EXPLICIT" ]]; then PG_CONN+=(--port="$PORT_EXPLICIT"); fi
+            if [[ -n "$USER_EXPLICIT" ]]; then PG_CONN+=(--username="$USER_EXPLICIT"); fi
+        else
+            PG_CONN+=(--host="$HOST" --port="$PORT" --username="$DBUSER")
+        fi
+        ;;
+esac
 
+# Password env. PASSWORD is only set when explicitly provided (no default), so in
+# login-path / service mode this stays unset and the store's password is used.
 if [[ -n "$PASSWORD" ]]; then
     case "$DRIVER" in
         mysql|mariadb) export MYSQL_PWD="$PASSWORD" ;;
@@ -250,7 +313,13 @@ DB_LIST=()
 if [[ "$DATABASES" == [Aa][Ll][Ll] ]]; then
     command -v "$CLIENT_BIN" >/dev/null 2>&1 \
         || die "$CLIENT_BIN not found in PATH (needed to enumerate databases)"
-    log "Enumerating databases on $DRIVER server $HOST:$PORT"
+    if [[ -n "$LOGIN_PATH" ]]; then
+        log "Enumerating databases via login-path '$LOGIN_PATH'"
+    elif [[ -n "$SERVICE" ]]; then
+        log "Enumerating databases via service '$SERVICE'"
+    else
+        log "Enumerating databases on $DRIVER server $HOST:$PORT"
+    fi
     set +e
     _raw="$(enumerate_databases)"
     _rc=$?
