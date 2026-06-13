@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# db-backup — stream database backups directly to object storage via rclone.
+#
+# Each database is dumped, gzipped, and uploaded in a single pipeline with no
+# temporary files at any point:
+#
+#     dump | gzip -c | rclone rcat <remote>/<timestamp>/<database>.sql.gz
+#
+# Targets bash (4.x/5.x) on Ubuntu/Linux servers. See --help for usage.
+
+set -eo pipefail
+
+# --- Defaults (lowest precedence: overridden by .env, then by CLI flags) -----
+DEFAULT_DRIVER=mysql
+DEFAULT_HOST=127.0.0.1
+DEFAULT_USER=root
+DEFAULT_DATABASES=ALL
+DEFAULT_RETENTION=30
+
+DRY_RUN=0
+QUIET=0
+VERBOSE=0
+
+# --- Logging -----------------------------------------------------------------
+_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+log() {
+    if [[ "$QUIET" == 1 ]]; then return 0; fi
+    local line="[$(_ts)] $*"
+    if [[ -n "${LOG:-}" ]]; then
+        printf '%s\n' "$line" | tee -a "$LOG"
+    else
+        printf '%s\n' "$line"
+    fi
+}
+
+err() {
+    local line="[$(_ts)] ERROR: $*"
+    if [[ -n "${LOG:-}" ]]; then
+        printf '%s\n' "$line" | tee -a "$LOG" >&2
+    else
+        printf '%s\n' "$line" >&2
+    fi
+}
+
+warn() {
+    local line="[$(_ts)] WARNING: $*"
+    if [[ -n "${LOG:-}" ]]; then
+        printf '%s\n' "$line" | tee -a "$LOG" >&2
+    else
+        printf '%s\n' "$line" >&2
+    fi
+}
+
+die() { err "$*"; exit 1; }
+
+# Human-readable byte count via numfmt, with a raw-bytes fallback.
+format_size() {
+    local b="$1"
+    if [[ -z "$b" || ! "$b" =~ ^[0-9]+$ ]]; then
+        printf 'unknown size'
+        return 0
+    fi
+    if command -v numfmt >/dev/null 2>&1; then
+        numfmt --to=iec --suffix=B "$b" 2>/dev/null || printf '%s B' "$b"
+    else
+        printf '%s B' "$b"
+    fi
+}
+
+# --- Driver functions (each writes the dump to stdout) -----------------------
+dump_mysql() {
+    "$DUMP_BIN" "${MYSQL_ARGS[@]}" \
+        --single-transaction --skip-lock-tables --routines --hex-blob -B "$1"
+}
+
+dump_pgsql() {
+    pg_dump --host="$HOST" --port="$PORT" --username="$DBUSER" \
+        --clean --create -F p "$1"
+}
+
+dump_db() {
+    case "$DRIVER" in
+        mysql|mariadb) dump_mysql "$1" ;;
+        pgsql)         dump_pgsql "$1" ;;
+    esac
+}
+
+# List databases on the server (system databases filtered by is_system_db / SQL).
+enumerate_databases() {
+    case "$DRIVER" in
+        mysql|mariadb)
+            "$CLIENT_BIN" "${MYSQL_ARGS[@]}" -N -e "SHOW DATABASES"
+            ;;
+        pgsql)
+            psql --host="$HOST" --port="$PORT" --username="$DBUSER" \
+                 --dbname=postgres -At \
+                 -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres';"
+            ;;
+    esac
+}
+
+is_system_db() {
+    case "$DRIVER" in
+        mysql|mariadb)
+            case "$1" in
+                information_schema|performance_schema|sys|mysql) return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+# --- Help --------------------------------------------------------------------
+show_help() {
+    cat <<'EOF'
+db-backup — stream database backups directly to object storage via rclone.
+
+USAGE
+  db-backup [OPTIONS]
+
+DATABASE OPTIONS
+  -d, --driver <driver>       mysql | mariadb | pgsql (default: mysql)
+  -h, --host <host>           default: 127.0.0.1
+  -P, --port <port>           default: driver default
+  -u, --user <user>           default: root
+  -p, --password <password>
+  -D, --databases <names>     Space-separated list, or ALL (default: ALL)
+
+STORAGE OPTIONS
+  -r, --primary <remote>      Required. e.g. hetzner:my-bucket/db-backups
+  -R, --secondary <remote>    Optional. Synced from primary after dumps complete.
+
+RETENTION OPTIONS
+  --retention <days>          Default: 30. 0 = disabled.
+
+OUTPUT OPTIONS
+  -l, --log <file>            Append to log file in addition to stdout
+  -n, --dry-run               Show what would run without executing
+  -q, --quiet                 Suppress output except errors
+  -v, --verbose               Pass verbose flag through to rclone
+
+GENERAL OPTIONS
+      --env <file>            Source a .env file (default: .env in current dir)
+      --help                  Show help
+
+ENVIRONMENT VARIABLES (CLI flags always take precedence)
+  DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES,
+  RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS, LOG_FILE
+
+RESTORE
+  # Stream directly into MySQL without downloading
+  rclone cat hetzner:my-bucket/db-backups/20250613020000/myapp.sql.gz \
+    | gunzip | mysql -u root -p myapp
+
+CRON
+  # /etc/cron.d/db-backup
+  0 2 * * * forge /usr/local/bin/db-backup --env /etc/backup/production.env --log /var/log/backup.log
+EOF
+}
+
+# --- Argument parsing --------------------------------------------------------
+need() { [[ "$2" -ge 2 ]] || die "Option '$1' requires a value"; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--driver)     need "$1" $#; CLI_DRIVER="$2";     shift 2 ;;
+        -h|--host)       need "$1" $#; CLI_HOST="$2";       shift 2 ;;
+        -P|--port)       need "$1" $#; CLI_PORT="$2";       shift 2 ;;
+        -u|--user)       need "$1" $#; CLI_USER="$2";       shift 2 ;;
+        -p|--password)   need "$1" $#; CLI_PASSWORD="$2";   shift 2 ;;
+        -D|--databases)  need "$1" $#; CLI_DATABASES="$2";  shift 2 ;;
+        -r|--primary)    need "$1" $#; CLI_PRIMARY="$2";    shift 2 ;;
+        -R|--secondary)  need "$1" $#; CLI_SECONDARY="$2";  shift 2 ;;
+        --retention)     need "$1" $#; CLI_RETENTION="$2";  shift 2 ;;
+        -l|--log)        need "$1" $#; CLI_LOG="$2";        shift 2 ;;
+        --env)           need "$1" $#; ENV_FILE="$2";       shift 2 ;;
+        -n|--dry-run)    DRY_RUN=1; shift ;;
+        -q|--quiet)      QUIET=1;   shift ;;
+        -v|--verbose)    VERBOSE=1; shift ;;
+        --help)          show_help; exit 0 ;;
+        --)              shift; break ;;
+        -*)              die "Unknown option: '$1' (try --help)" ;;
+        *)               die "Unexpected argument: '$1' (try --help)" ;;
+    esac
+done
+
+# --- Load .env (explicit --env, else .env in the invocation directory) -------
+# CLI flags were captured into CLI_* above; .env is sourced now and resolved
+# below so CLI always wins over env vars, which win over defaults.
+if [[ -n "${ENV_FILE:-}" ]]; then
+    [[ -f "$ENV_FILE" ]] || die "Env file not found: $ENV_FILE"
+    set -a; . "$ENV_FILE"; set +a
+elif [[ -f "$PWD/.env" ]]; then
+    set -a; . "$PWD/.env"; set +a
+fi
+
+# --- Resolve configuration (CLI > env > default) -----------------------------
+DRIVER="${CLI_DRIVER:-${DB_DRIVER:-$DEFAULT_DRIVER}}"
+HOST="${CLI_HOST:-${DB_HOST:-$DEFAULT_HOST}}"
+PORT="${CLI_PORT:-${DB_PORT:-}}"
+DBUSER="${CLI_USER:-${DB_USER:-$DEFAULT_USER}}"
+PASSWORD="${CLI_PASSWORD:-${DB_PASSWORD:-}}"
+DATABASES="${CLI_DATABASES:-${DB_NAMES:-$DEFAULT_DATABASES}}"
+PRIMARY="${CLI_PRIMARY:-${RCLONE_PRIMARY:-}}"
+SECONDARY="${CLI_SECONDARY:-${RCLONE_SECONDARY:-}}"
+RETENTION="${CLI_RETENTION:-${RETENTION_DAYS:-$DEFAULT_RETENTION}}"
+LOG="${CLI_LOG:-${LOG_FILE:-}}"
+
+# --- Validate ----------------------------------------------------------------
+case "$DRIVER" in
+    mysql)   DUMP_BIN=mysqldump;    CLIENT_BIN=mysql ;;
+    mariadb) DUMP_BIN=mariadb-dump; CLIENT_BIN=mariadb ;;
+    pgsql)   DUMP_BIN=pg_dump;      CLIENT_BIN=psql ;;
+    *)       die "Invalid driver: '$DRIVER' (expected mysql, mariadb, or pgsql)" ;;
+esac
+
+if [[ -z "$PORT" ]]; then
+    case "$DRIVER" in
+        pgsql) PORT=5432 ;;
+        *)     PORT=3306 ;;
+    esac
+fi
+
+[[ -n "$PRIMARY" ]] || die "Missing required --primary (or RCLONE_PRIMARY)"
+[[ "$RETENTION" =~ ^[0-9]+$ ]] || die "Invalid --retention: '$RETENTION' (expected a non-negative integer)"
+
+command -v rclone     >/dev/null 2>&1 || die "rclone not found in PATH"
+command -v gzip       >/dev/null 2>&1 || die "gzip not found in PATH"
+command -v "$DUMP_BIN" >/dev/null 2>&1 || die "$DUMP_BIN not found in PATH"
+
+PRIMARY="${PRIMARY%/}"
+if [[ -n "$SECONDARY" ]]; then SECONDARY="${SECONDARY%/}"; fi
+
+# --- Build per-driver connection args + password env -------------------------
+MYSQL_ARGS=(--host="$HOST" --port="$PORT" --user="$DBUSER")
+
+if [[ -n "$PASSWORD" ]]; then
+    case "$DRIVER" in
+        mysql|mariadb) export MYSQL_PWD="$PASSWORD" ;;
+        pgsql)         export PGPASSWORD="$PASSWORD" ;;
+    esac
+fi
+
+RCLONE_OPTS=()
+if [[ "$VERBOSE" == 1 ]]; then RCLONE_OPTS+=(-v); fi
+
+# --- Build the list of databases to back up ----------------------------------
+DB_LIST=()
+if [[ "$DATABASES" == [Aa][Ll][Ll] ]]; then
+    command -v "$CLIENT_BIN" >/dev/null 2>&1 \
+        || die "$CLIENT_BIN not found in PATH (needed to enumerate databases)"
+    log "Enumerating databases on $DRIVER server $HOST:$PORT"
+    set +e
+    _raw="$(enumerate_databases)"
+    _rc=$?
+    set -e
+    [[ $_rc -eq 0 ]] || die "Failed to enumerate databases from server (exit $_rc)"
+    while IFS= read -r _name; do
+        [[ -n "$_name" ]] || continue
+        if is_system_db "$_name"; then continue; fi
+        DB_LIST+=("$_name")
+    done <<< "$_raw"
+else
+    read -r -a DB_LIST <<< "$DATABASES"
+fi
+
+[[ ${#DB_LIST[@]} -gt 0 ]] || die "No databases to back up (empty list after enumeration)"
+
+# --- Back up one database: dump | gzip -c | rclone rcat ----------------------
+TIMESTAMP="$(date '+%Y%m%d%H%M%S')"
+FAILED=0
+RESULT_LINES=()
+
+backup_database() {
+    local db="$1"
+    local dest="${PRIMARY}/${TIMESTAMP}/${db}.sql.gz"
+    local -a st
+    local bytes human
+
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY RUN: would back up '$db' -> $dest"
+        RESULT_LINES+=("$db  DRY-RUN  -> $dest")
+        return 0
+    fi
+
+    log "Backing up '$db' -> $dest"
+
+    set +e
+    dump_db "$db" | gzip -c | rclone rcat "${RCLONE_OPTS[@]}" "$dest"
+    st=("${PIPESTATUS[@]}")
+    set -e
+
+    if [[ "${st[0]}" -ne 0 ]]; then
+        err "'$db': dump stage ($DUMP_BIN) failed (exit ${st[0]})"
+        FAILED=1; RESULT_LINES+=("$db  FAILED(dump)  -"); return 0
+    fi
+    if [[ "${st[1]}" -ne 0 ]]; then
+        err "'$db': gzip stage failed (exit ${st[1]})"
+        FAILED=1; RESULT_LINES+=("$db  FAILED(gzip)  -"); return 0
+    fi
+    if [[ "${st[2]}" -ne 0 ]]; then
+        err "'$db': upload stage (rclone rcat) failed (exit ${st[2]})"
+        FAILED=1; RESULT_LINES+=("$db  FAILED(upload)  -"); return 0
+    fi
+
+    bytes="$(rclone size --json "$dest" 2>/dev/null \
+        | grep -o '"bytes":[0-9]*' | head -n1 | cut -d: -f2 || true)"
+    human="$(format_size "${bytes:-0}")"
+    log "OK: '$db' ($human compressed)"
+    RESULT_LINES+=("$db  OK  $human")
+    return 0
+}
+
+# --- Run ---------------------------------------------------------------------
+log "=== db-backup starting (driver=$DRIVER, timestamp=$TIMESTAMP) ==="
+log "Databases: ${DB_LIST[*]}"
+
+for db in "${DB_LIST[@]}"; do
+    backup_database "$db"
+done
+
+# --- Retention (prune primary first so the deletions propagate via sync) -----
+if [[ "$RETENTION" -gt 0 ]]; then
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY RUN: would prune files older than ${RETENTION}d from $PRIMARY"
+    else
+        log "Pruning files older than ${RETENTION}d from primary"
+        set +e
+        rclone delete "$PRIMARY" --min-age "${RETENTION}d" --rmdirs "${RCLONE_OPTS[@]}"
+        _prc=$?
+        set -e
+        if [[ $_prc -ne 0 ]]; then
+            err "Retention prune failed (exit $_prc)"
+            FAILED=1
+        fi
+    fi
+else
+    log "Retention disabled (--retention 0)"
+fi
+
+# --- Secondary sync (warning-only; does not affect exit code) ----------------
+if [[ -n "$SECONDARY" ]]; then
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY RUN: would sync $PRIMARY -> $SECONDARY"
+    else
+        log "Syncing primary -> secondary ($SECONDARY)"
+        set +e
+        rclone sync "$PRIMARY" "$SECONDARY" "${RCLONE_OPTS[@]}"
+        _src=$?
+        set -e
+        if [[ $_src -ne 0 ]]; then
+            warn "Secondary sync failed (exit $_src) — primary backup unaffected"
+        else
+            log "Secondary sync complete"
+        fi
+    fi
+fi
+
+# --- Summary -----------------------------------------------------------------
+log "----- Summary ($TIMESTAMP) -----"
+for line in "${RESULT_LINES[@]}"; do
+    log "  $line"
+done
+
+if [[ "$FAILED" -eq 1 ]]; then
+    err "Backup completed with FAILURES"
+    log "Overall: FAILED"
+    exit 1
+fi
+log "Overall: OK"
+exit 0
