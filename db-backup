@@ -138,7 +138,21 @@ STORAGE OPTIONS
   -R, --secondary <remote>    Optional. Synced from primary after dumps complete.
 
 RETENTION OPTIONS
-  --retention <days>          Default: 30. 0 = disabled.
+  --retention <days>          Default: 30. 0 = disabled. Ignored (with a
+                              warning, if explicitly set) when any of
+                              --hourly/--daily/--monthly below are used.
+  --hourly <hours>            Tiered retention: keep every backup from the
+                              last N hours. Default: 0 (disabled).
+  --daily <days>              Beyond the hourly window, keep the most recent
+                              backup per calendar day, for N days. Default: 0.
+  --monthly <months>          Beyond the daily window, keep the most recent
+                              backup per calendar month, for N months
+                              (calendar-accurate). Default: 0.
+                              Setting any of --hourly/--daily/--monthly (or
+                              their env vars) -- even to 0 -- switches to
+                              tiered retention; --hourly/--daily/--monthly all
+                              0 is rejected, since it would delete every
+                              backup including the one just made.
 
 OUTPUT OPTIONS
   -l, --log <file>            Append to log file in addition to stdout
@@ -152,8 +166,11 @@ GENERAL OPTIONS
 
 ENVIRONMENT VARIABLES (CLI flags always take precedence)
   DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES, DB_LOGIN_PATH,
-  DB_SERVICE, RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS, LOG_FILE
-  (pgsql also honours the standard PGSERVICE variable.)
+  DB_SERVICE, RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS,
+  RETENTION_HOURLY, RETENTION_DAILY, RETENTION_MONTHLY, LOG_FILE
+  (pgsql also honours the standard PGSERVICE variable. Setting any of
+  RETENTION_HOURLY/RETENTION_DAILY/RETENTION_MONTHLY switches to tiered
+  retention; see RETENTION OPTIONS above.)
 
 CREDENTIALS
   Like rclone remotes, credentials can live in a named store instead of flags:
@@ -171,8 +188,12 @@ RESTORE
     | gunzip | mysql -u root -p myapp
 
 CRON
-  # /etc/cron.d/db-backup
+  # /etc/cron.d/db-backup -- flat retention, one daily run:
   0 2 * * * forge /usr/local/bin/db-backup --env /etc/backup/production.env --log /var/log/backup.log
+
+  # Tiered retention needs only ONE schedule too -- hourly is enough, since
+  # prune_tiered itself thins older backups down to daily/monthly granularity:
+  0 * * * * forge /usr/local/bin/db-backup --env /etc/backup/production.env --log /var/log/backup.log --hourly 48 --daily 14 --monthly 6
 EOF
 }
 
@@ -192,6 +213,9 @@ while [[ $# -gt 0 ]]; do
         -r|--primary)    need "$1" $#; CLI_PRIMARY="$2";    shift 2 ;;
         -R|--secondary)  need "$1" $#; CLI_SECONDARY="$2";  shift 2 ;;
         --retention)     need "$1" $#; CLI_RETENTION="$2";  shift 2 ;;
+        --hourly)        need "$1" $#; CLI_HOURLY="$2";      shift 2 ;;
+        --daily)         need "$1" $#; CLI_DAILY="$2";       shift 2 ;;
+        --monthly)       need "$1" $#; CLI_MONTHLY="$2";     shift 2 ;;
         -l|--log)        need "$1" $#; CLI_LOG="$2";        shift 2 ;;
         --env)           need "$1" $#; ENV_FILE="$2";       shift 2 ;;
         -n|--dry-run)    DRY_RUN=1; shift ;;
@@ -235,6 +259,18 @@ SECONDARY="${CLI_SECONDARY:-${RCLONE_SECONDARY:-}}"
 RETENTION="${CLI_RETENTION:-${RETENTION_DAYS:-$DEFAULT_RETENTION}}"
 LOG="${CLI_LOG:-${LOG_FILE:-}}"
 
+# Tiered ("grandfather-father-son") retention. Presence (not value) of any of
+# these three -- flag or env var, even set to 0 -- switches into tiered mode,
+# where the flat RETENTION above is ignored instead of combined with it.
+TIER_MODE=0
+if [[ -n "${CLI_HOURLY+x}" || -n "${CLI_DAILY+x}" || -n "${CLI_MONTHLY+x}" \
+   || -n "${RETENTION_HOURLY+x}" || -n "${RETENTION_DAILY+x}" || -n "${RETENTION_MONTHLY+x}" ]]; then
+    TIER_MODE=1
+fi
+HOURLY="${CLI_HOURLY:-${RETENTION_HOURLY:-0}}"
+DAILY="${CLI_DAILY:-${RETENTION_DAILY:-0}}"
+MONTHLY="${CLI_MONTHLY:-${RETENTION_MONTHLY:-0}}"
+
 # --- Validate ----------------------------------------------------------------
 case "$DRIVER" in
     mysql)   DUMP_BIN=mysqldump;    CLIENT_BIN=mysql ;;
@@ -259,6 +295,20 @@ fi
 
 [[ -n "$PRIMARY" ]] || die "Missing required --primary (or RCLONE_PRIMARY)"
 [[ "$RETENTION" =~ ^[0-9]+$ ]] || die "Invalid --retention: '$RETENTION' (expected a non-negative integer)"
+
+[[ "$HOURLY" =~ ^[0-9]+$ ]]  || die "Invalid --hourly: '$HOURLY' (expected a non-negative integer)"
+[[ "$DAILY" =~ ^[0-9]+$ ]]   || die "Invalid --daily: '$DAILY' (expected a non-negative integer)"
+[[ "$MONTHLY" =~ ^[0-9]+$ ]] || die "Invalid --monthly: '$MONTHLY' (expected a non-negative integer)"
+# Force base-10: these feed arithmetic below, where a leading zero (e.g. "08")
+# would otherwise be parsed as octal by bash and error out (or silently change
+# value, e.g. "07" -> 7 is fine but "08"/"09" are invalid octal digits).
+HOURLY=$((10#$HOURLY))
+DAILY=$((10#$DAILY))
+MONTHLY=$((10#$MONTHLY))
+
+if [[ "$TIER_MODE" == 1 && "$HOURLY" -eq 0 && "$DAILY" -eq 0 && "$MONTHLY" -eq 0 ]]; then
+    die "Tiered retention active but --hourly/--daily/--monthly are all 0 (unlike --retention 0, this would delete every backup, including the one just made)"
+fi
 
 command -v rclone     >/dev/null 2>&1 || die "rclone not found in PATH"
 command -v gzip       >/dev/null 2>&1 || die "gzip not found in PATH"
@@ -381,6 +431,141 @@ backup_database() {
     return 0
 }
 
+# --- Tiered ("grandfather-father-son") retention ------------------------------
+# Parse a TIMESTAMP-formatted folder name (this script's own YYYYMMDDHHMMSS
+# format) into epoch seconds. Deliberately does NOT use rclone's mtime metadata
+# (--min-age / lsjson ModTime): on S3-compatible backends like R2, "directories"
+# are synthetic common-prefixes with unreliable/fabricated mtimes, whereas the
+# epoch is fully recoverable from the name this script itself writes.
+ts_to_epoch() {
+    local ts="$1"
+    date -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:8:2}:${ts:10:2}:${ts:12:2}" +%s
+}
+
+# Keep every backup within the hourly window; beyond that, keep only the most
+# recent backup per calendar day (daily window), then per calendar month
+# (monthly window); delete anything older than all three. Windows are expected
+# to nest (hourly <= daily <= monthly) for intuitive GFS behaviour, but this
+# isn't enforced -- an omitted/zero tier just has zero width, so anything past
+# the previous tier's cutoff falls straight through to the next check.
+prune_tiered() {
+    local now cutoff_hourly cutoff_daily cutoff_monthly
+    local -a folders valid
+    local entry ts epoch daykey monthkey
+    local _raw _rc _erc _prc
+    local kept_hourly=0 kept_daily=0 kept_monthly=0 deleted=0
+    local -A day_max=() month_max=() zone_of=() epoch_of=()
+
+    now="$(date +%s)"
+    cutoff_hourly=$((now - HOURLY * 3600))
+    cutoff_daily=$((now - DAILY * 86400))
+    cutoff_monthly="$(date -d "-${MONTHLY} months" +%s)"
+
+    # Command substitution (not process substitution) so $? reflects rclone's
+    # exit code, not the reading loop's -- mirrors enumerate_databases above.
+    set +e
+    _raw="$(rclone lsf "$PRIMARY" --dirs-only "${RCLONE_OPTS[@]}")"
+    _rc=$?
+    set -e
+    if [[ $_rc -ne 0 ]]; then
+        err "Failed to list $PRIMARY for tiered retention (exit $_rc)"
+        FAILED=1
+        return 0
+    fi
+
+    folders=()
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        folders+=("$entry")
+    done <<< "$_raw"
+
+    # Pass 1: validate + classify each folder into a zone, tracking the newest
+    # epoch seen per day/month bucket so pass 2 can keep only the most recent.
+    valid=()
+    for entry in "${folders[@]}"; do
+        ts="${entry%/}"
+        if [[ ! "$ts" =~ ^[0-9]{14}$ ]]; then
+            warn "Skipping unrecognised entry in $PRIMARY: '$entry'"
+            continue
+        fi
+
+        set +e
+        epoch="$(ts_to_epoch "$ts")"
+        _erc=$?
+        set -e
+        if [[ $_erc -ne 0 || -z "$epoch" ]]; then
+            warn "Skipping folder with unparseable timestamp: '$ts'"
+            continue
+        fi
+
+        valid+=("$ts")
+        epoch_of["$ts"]="$epoch"
+
+        if [[ "$epoch" -ge "$cutoff_hourly" ]]; then
+            zone_of["$ts"]=hourly
+        elif [[ "$epoch" -ge "$cutoff_daily" ]]; then
+            zone_of["$ts"]=daily
+            daykey="${ts:0:8}"
+            if [[ -z "${day_max[$daykey]:-}" || "$epoch" -gt "${day_max[$daykey]}" ]]; then
+                day_max["$daykey"]="$epoch"
+            fi
+        elif [[ "$epoch" -ge "$cutoff_monthly" ]]; then
+            zone_of["$ts"]=monthly
+            monthkey="${ts:0:6}"
+            if [[ -z "${month_max[$monthkey]:-}" || "$epoch" -gt "${month_max[$monthkey]}" ]]; then
+                month_max["$monthkey"]="$epoch"
+            fi
+        else
+            zone_of["$ts"]=expired
+        fi
+    done
+
+    # Pass 2: keep the winner of each bucket (or everything hourly); purge the rest.
+    for ts in "${valid[@]}"; do
+        epoch="${epoch_of[$ts]}"
+        case "${zone_of[$ts]}" in
+            hourly)
+                kept_hourly=$((kept_hourly + 1))
+                continue
+                ;;
+            daily)
+                daykey="${ts:0:8}"
+                if [[ "$epoch" -eq "${day_max[$daykey]}" ]]; then
+                    kept_daily=$((kept_daily + 1))
+                    continue
+                fi
+                ;;
+            monthly)
+                monthkey="${ts:0:6}"
+                if [[ "$epoch" -eq "${month_max[$monthkey]}" ]]; then
+                    kept_monthly=$((kept_monthly + 1))
+                    continue
+                fi
+                ;;
+            expired) ;;
+        esac
+
+        if [[ "$DRY_RUN" == 1 ]]; then
+            log "DRY RUN: would purge $PRIMARY/$ts"
+        else
+            set +e
+            rclone purge "${RCLONE_OPTS[@]}" "$PRIMARY/$ts"
+            _prc=$?
+            set -e
+            if [[ $_prc -ne 0 ]]; then
+                err "Failed to purge $PRIMARY/$ts (exit $_prc)"
+                FAILED=1
+                continue
+            fi
+        fi
+        deleted=$((deleted + 1))
+    done
+
+    local verb="deleted"
+    [[ "$DRY_RUN" == 1 ]] && verb="would delete"
+    log "Tiered retention: kept ${kept_hourly} hourly / ${kept_daily} daily / ${kept_monthly} monthly; $verb ${deleted}"
+}
+
 # --- Run ---------------------------------------------------------------------
 log "=== db-backup starting (driver=$DRIVER, timestamp=$TIMESTAMP) ==="
 log "Databases: ${DB_LIST[*]}"
@@ -390,22 +575,29 @@ for db in "${DB_LIST[@]}"; do
 done
 
 # --- Retention (prune primary first so the deletions propagate via sync) -----
-if [[ "$RETENTION" -gt 0 ]]; then
-    if [[ "$DRY_RUN" == 1 ]]; then
-        log "DRY RUN: would prune files older than ${RETENTION}d from $PRIMARY"
-    else
-        log "Pruning files older than ${RETENTION}d from primary"
-        set +e
-        rclone delete "$PRIMARY" --min-age "${RETENTION}d" --rmdirs "${RCLONE_OPTS[@]}"
-        _prc=$?
-        set -e
-        if [[ $_prc -ne 0 ]]; then
-            err "Retention prune failed (exit $_prc)"
-            FAILED=1
-        fi
+if [[ "$TIER_MODE" == 1 ]]; then
+    if [[ -n "${CLI_RETENTION+x}" || -n "${RETENTION_DAYS+x}" ]]; then
+        warn "Tiered retention active (--hourly/--daily/--monthly); ignoring --retention/RETENTION_DAYS ($RETENTION)"
     fi
+    prune_tiered
 else
-    log "Retention disabled (--retention 0)"
+    if [[ "$RETENTION" -gt 0 ]]; then
+        if [[ "$DRY_RUN" == 1 ]]; then
+            log "DRY RUN: would prune files older than ${RETENTION}d from $PRIMARY"
+        else
+            log "Pruning files older than ${RETENTION}d from primary"
+            set +e
+            rclone delete "$PRIMARY" --min-age "${RETENTION}d" --rmdirs "${RCLONE_OPTS[@]}"
+            _prc=$?
+            set -e
+            if [[ $_prc -ne 0 ]]; then
+                err "Retention prune failed (exit $_prc)"
+                FAILED=1
+            fi
+        fi
+    else
+        log "Retention disabled (--retention 0)"
+    fi
 fi
 
 # --- Secondary sync (warning-only; does not affect exit code) ----------------
