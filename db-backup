@@ -561,12 +561,18 @@ prune_tiered() {
         deleted=${#to_delete[@]}
     elif [[ ${#to_delete[@]} -gt 0 ]]; then
         filter_file="$(mktemp)"
+        # Covers a kill/timeout while rclone is mid-run, not just normal
+        # completion -- mktemp's file is already 0600/owner-only, this just
+        # avoids leaving it behind if the process dies before the plain
+        # rm -f below runs.
+        trap 'rm -f "$filter_file"' EXIT
         printf '%s/**\n' "${to_delete[@]}" > "$filter_file"
         set +e
         rclone delete "$PRIMARY" --include-from "$filter_file" --rmdirs "${RCLONE_OPTS[@]}"
         _prc=$?
         set -e
         rm -f "$filter_file"
+        trap - EXIT
         if [[ $_prc -ne 0 ]]; then
             err "Failed to purge ${#to_delete[@]} expired backup folder(s) (exit $_prc)"
             FAILED=1
