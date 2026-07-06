@@ -6,7 +6,15 @@
 #
 #     dump | gzip -c | rclone rcat <remote>/<timestamp>/<database>.sql.gz
 #
-# Targets bash (4.x/5.x) on Ubuntu/Linux servers. See --help for usage.
+# Targets bash (4.x/5.x) with GNU coreutils on Ubuntu/Debian/RHEL-family
+# Linux servers (verified: Ubuntu, Debian, Rocky Linux -- all ship both by
+# default). Alpine and other busybox/musl-based distros ship neither: bash
+# isn't installed by default, and busybox's `date` doesn't support the
+# relative-date parsing (`date -d "-N months"`) that the tiered-retention
+# monthly-window calculation depends on. `apk add bash coreutils` (or
+# equivalent) fixes both if this ever needs to run there.
+#
+# See --help for usage.
 
 set -eo pipefail
 
