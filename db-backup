@@ -450,8 +450,8 @@ ts_to_epoch() {
 # the previous tier's cutoff falls straight through to the next check.
 prune_tiered() {
     local now cutoff_hourly cutoff_daily cutoff_monthly
-    local -a folders valid
-    local entry ts epoch daykey monthkey
+    local -a folders valid to_delete
+    local entry ts epoch daykey monthkey filter_file
     local _raw _rc _erc _prc
     local kept_hourly=0 kept_daily=0 kept_monthly=0 deleted=0
     local -A day_max=() month_max=() zone_of=() epoch_of=()
@@ -520,7 +520,8 @@ prune_tiered() {
         fi
     done
 
-    # Pass 2: keep the winner of each bucket (or everything hourly); purge the rest.
+    # Pass 2: keep the winner of each bucket (or everything hourly); collect the rest.
+    to_delete=()
     for ts in "${valid[@]}"; do
         epoch="${epoch_of[$ts]}"
         case "${zone_of[$ts]}" in
@@ -544,22 +545,35 @@ prune_tiered() {
                 ;;
             expired) ;;
         esac
-
-        if [[ "$DRY_RUN" == 1 ]]; then
-            log "DRY RUN: would purge $PRIMARY/$ts"
-        else
-            set +e
-            rclone purge "${RCLONE_OPTS[@]}" "$PRIMARY/$ts"
-            _prc=$?
-            set -e
-            if [[ $_prc -ne 0 ]]; then
-                err "Failed to purge $PRIMARY/$ts (exit $_prc)"
-                FAILED=1
-                continue
-            fi
-        fi
-        deleted=$((deleted + 1))
+        to_delete+=("$ts")
     done
+
+    # Delete everything in one rclone call rather than one purge per folder.
+    # rclone purge doesn't obey filters, so this uses `delete --include-from`
+    # instead. This also means the (harmless) per-call GetBucketVersioning
+    # probe some S3-compatible backends 403 on -- R2 has no versioning
+    # concept, so rclone falls back to "assume unversioned" and proceeds --
+    # only happens once per run instead of once per deleted folder.
+    if [[ "$DRY_RUN" == 1 ]]; then
+        for ts in "${to_delete[@]}"; do
+            log "DRY RUN: would purge $PRIMARY/$ts"
+        done
+        deleted=${#to_delete[@]}
+    elif [[ ${#to_delete[@]} -gt 0 ]]; then
+        filter_file="$(mktemp)"
+        printf '%s/**\n' "${to_delete[@]}" > "$filter_file"
+        set +e
+        rclone delete "$PRIMARY" --include-from "$filter_file" --rmdirs "${RCLONE_OPTS[@]}"
+        _prc=$?
+        set -e
+        rm -f "$filter_file"
+        if [[ $_prc -ne 0 ]]; then
+            err "Failed to purge ${#to_delete[@]} expired backup folder(s) (exit $_prc)"
+            FAILED=1
+        else
+            deleted=${#to_delete[@]}
+        fi
+    fi
 
     local verb="deleted"
     [[ "$DRY_RUN" == 1 ]] && verb="would delete"
