@@ -21,7 +21,6 @@ set -eo pipefail
 # --- Defaults (lowest precedence: overridden by .env, then by CLI flags) -----
 DEFAULT_DRIVER=mysql
 DEFAULT_HOST=127.0.0.1
-DEFAULT_USER=root
 DEFAULT_DATABASES=ALL
 DEFAULT_RETENTION=30
 
@@ -82,8 +81,10 @@ dump_mysql() {
         --single-transaction --skip-lock-tables --routines --hex-blob -B "$1"
 }
 
+# --clean --create emits DROP/CREATE DATABASE; --if-exists keeps the DROP from
+# erroring when restoring onto a server that doesn't have the database yet.
 dump_pgsql() {
-    pg_dump "${PG_CONN[@]}" --clean --create -F p "$1"
+    "$DUMP_BIN" "${PG_CONN[@]}" --clean --if-exists --create -F p "$1"
 }
 
 dump_db() {
@@ -133,7 +134,7 @@ DATABASE OPTIONS
   -d, --driver <driver>       mysql | mariadb | pgsql (default: mysql)
   -h, --host <host>           default: 127.0.0.1
   -P, --port <port>           default: driver default
-  -u, --user <user>           default: root
+  -u, --user <user>           default: root (mysql/mariadb), postgres (pgsql)
   -p, --password <password>
       --login-path <name>     mysql/mariadb: read credentials from a named
                               mysql_config_editor login-path instead of -u/-p
@@ -195,6 +196,11 @@ RESTORE
   rclone cat hetzner:my-bucket/db-backups/20250613020000/myapp.sql.gz \
     | gunzip | mysql -u root -p myapp
 
+  # PostgreSQL: the dump drops and recreates the database itself, so connect
+  # to a different one (e.g. postgres). Stop other connections to it first.
+  rclone cat hetzner:my-bucket/db-backups/20250613020000/myapp.sql.gz \
+    | gunzip | psql -U postgres -d postgres -v ON_ERROR_STOP=1
+
 CRON
   # /etc/cron.d/db-backup -- flat retention, one daily run:
   0 2 * * * forge /usr/local/bin/db-backup --env /etc/backup/production.env --log /var/log/backup.log
@@ -250,7 +256,7 @@ fi
 DRIVER="${CLI_DRIVER:-${DB_DRIVER:-$DEFAULT_DRIVER}}"
 HOST="${CLI_HOST:-${DB_HOST:-$DEFAULT_HOST}}"
 PORT="${CLI_PORT:-${DB_PORT:-}}"
-DBUSER="${CLI_USER:-${DB_USER:-$DEFAULT_USER}}"
+DBUSER="${CLI_USER:-${DB_USER:-}}"
 PASSWORD="${CLI_PASSWORD:-${DB_PASSWORD:-}}"
 LOGIN_PATH="${CLI_LOGIN_PATH:-${DB_LOGIN_PATH:-}}"
 SERVICE="${CLI_SERVICE:-${DB_SERVICE:-${PGSERVICE:-}}}"
@@ -291,6 +297,12 @@ if [[ -z "$PORT" ]]; then
     case "$DRIVER" in
         pgsql) PORT=5432 ;;
         *)     PORT=3306 ;;
+    esac
+fi
+if [[ -z "$DBUSER" ]]; then
+    case "$DRIVER" in
+        pgsql) DBUSER=postgres ;;
+        *)     DBUSER=root ;;
     esac
 fi
 
