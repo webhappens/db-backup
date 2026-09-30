@@ -190,6 +190,14 @@ CREDENTIALS
       # ~/.pg_service.conf -> [prod] host=H user=U dbname=postgres
       # ~/.pgpass (chmod 600) -> H:5432:*:U:secret
       db-backup --driver pgsql --service prod -r hetzner:my-bucket/db-backups
+    pgsql on the same machine, no password at all (peer auth): connect over
+    the Unix socket as the role matching your OS user. Needs a `local ...
+    peer` line in pg_hba.conf (the Ubuntu/Debian default) and PostgreSQL 14+
+    for pg_read_all_data:
+      sudo -u postgres createuser forge    # skip if the role already exists
+      sudo -u postgres psql -c 'GRANT pg_read_all_data TO forge'
+      db-backup --driver pgsql --host /var/run/postgresql --user forge \
+        -r hetzner:my-bucket/db-backups
 
 RESTORE
   # Stream directly into MySQL without downloading
@@ -213,6 +221,8 @@ EOF
 
 # --- Argument parsing --------------------------------------------------------
 need() { [[ "$2" -ge 2 ]] || die "Option '$1' requires a value"; }
+
+if [[ $# -eq 0 ]]; then show_help; exit 0; fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
