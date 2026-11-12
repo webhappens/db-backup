@@ -28,6 +28,10 @@ DRY_RUN=0
 QUIET=0
 VERBOSE=0
 
+STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+ARCHIVES=()     # one JSON object per database, sent with the completion ping
+FILTER_FILE=""  # tiered-retention temp file, removed by on_exit
+
 # --- Logging -----------------------------------------------------------------
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
@@ -61,6 +65,12 @@ warn() {
 
 die() { err "$*"; exit 1; }
 
+json_str() {
+    local s="${1//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
 # Human-readable byte count via numfmt, with a raw-bytes fallback.
 format_size() {
     local b="$1"
@@ -76,9 +86,13 @@ format_size() {
 }
 
 # --- Driver functions (each writes the dump to stdout) -----------------------
+# Same flags as Forge's backup.sh, plus --no-tablespaces: since MySQL 8.0.21,
+# dumping tablespace info needs the PROCESS privilege, so a least-privilege
+# backup user fails without it. Laravel apps don't use tablespaces.
 dump_mysql() {
     "$DUMP_BIN" "${MYSQL_ARGS[@]}" \
-        --single-transaction --skip-lock-tables --routines --hex-blob -B "$1"
+        --single-transaction --skip-lock-tables --routines --hex-blob \
+        --no-tablespaces -B "$1"
 }
 
 # --clean --create emits DROP/CREATE DATABASE; --if-exists keeps the DROP from
@@ -162,6 +176,17 @@ RETENTION OPTIONS
                               tiered retention; --hourly/--daily/--monthly all
                               0 is rejected, since it would delete every
                               backup including the one just made.
+  Retention is skipped when any database fails to back up, so a failed run
+  never causes older good backups to be deleted.
+
+MONITORING OPTIONS
+  --ping <url>                POST the outcome to <url> on every exit,
+                              including failures. "{status}" in the URL is
+                              replaced with the exit code (0 = success), e.g.
+                              https://hc-ping.com/<uuid>/{status}
+                              Form fields: status, host, timestamp, started_at,
+                              finished_at, path, archives (JSON array of
+                              {database, status, bytes|stage}).
 
 OUTPUT OPTIONS
   -l, --log <file>            Append to log file in addition to stdout
@@ -176,7 +201,7 @@ GENERAL OPTIONS
 ENVIRONMENT VARIABLES (CLI flags always take precedence)
   DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES, DB_LOGIN_PATH,
   DB_SERVICE, RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS,
-  RETENTION_HOURLY, RETENTION_DAILY, RETENTION_MONTHLY, LOG_FILE
+  RETENTION_HOURLY, RETENTION_DAILY, RETENTION_MONTHLY, LOG_FILE, PING_URL
   (pgsql also honours the standard PGSERVICE variable. Setting any of
   RETENTION_HOURLY/RETENTION_DAILY/RETENTION_MONTHLY switches to tiered
   retention; see RETENTION OPTIONS above.)
@@ -241,6 +266,7 @@ while [[ $# -gt 0 ]]; do
         --daily)         need "$1" $#; CLI_DAILY="$2";       shift 2 ;;
         --monthly)       need "$1" $#; CLI_MONTHLY="$2";     shift 2 ;;
         -l|--log)        need "$1" $#; CLI_LOG="$2";        shift 2 ;;
+        --ping)          need "$1" $#; CLI_PING="$2";       shift 2 ;;
         --env)           need "$1" $#; ENV_FILE="$2";       shift 2 ;;
         -n|--dry-run)    DRY_RUN=1; shift ;;
         -q|--quiet)      QUIET=1;   shift ;;
@@ -282,6 +308,7 @@ PRIMARY="${CLI_PRIMARY:-${RCLONE_PRIMARY:-}}"
 SECONDARY="${CLI_SECONDARY:-${RCLONE_SECONDARY:-}}"
 RETENTION="${CLI_RETENTION:-${RETENTION_DAYS:-$DEFAULT_RETENTION}}"
 LOG="${CLI_LOG:-${LOG_FILE:-}}"
+PING_URL="${CLI_PING:-${PING_URL:-}}"
 
 # Tiered ("grandfather-father-son") retention. Presence (not value) of any of
 # these three -- flag or env var, even set to 0 -- switches into tiered mode,
@@ -294,6 +321,47 @@ fi
 HOURLY="${CLI_HOURLY:-${RETENTION_HOURLY:-0}}"
 DAILY="${CLI_DAILY:-${RETENTION_DAILY:-0}}"
 MONTHLY="${CLI_MONTHLY:-${RETENTION_MONTHLY:-0}}"
+
+# --- Exit handler: cleanup + completion ping ---------------------------------
+# Runs on every exit -- success, die(), or an unexpected error -- so the ping
+# always reports the outcome (the same approach as Forge's backup.sh). Must not
+# call exit or let a command fail, or it would change the script's exit code.
+if [[ -n "$PING_URL" ]]; then
+    command -v curl >/dev/null 2>&1 || die "curl not found in PATH (needed for --ping)"
+fi
+
+# shellcheck disable=SC2317  # invoked via trap
+on_exit() {
+    local rc="$1" url path="" archives
+    if [[ -n "$FILTER_FILE" ]]; then rm -f "$FILTER_FILE"; fi
+    [[ -n "$PING_URL" ]] || return 0
+
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY RUN: would ping completion URL (status=$rc)"
+        return 0
+    fi
+
+    url="${PING_URL//\{status\}/$rc}"
+    if [[ -n "${TIMESTAMP:-}" ]]; then
+        path="${PRIMARY}/${TIMESTAMP}"
+        # A connection-string remote (":s3,secret_access_key=...:bucket") can
+        # embed credentials; send only the path after the last colon.
+        if [[ "$path" == *,* ]]; then path="${path##*:}"; fi
+    fi
+    archives="$(IFS=,; printf '[%s]' "${ARCHIVES[*]}")"
+
+    log "Pinging completion URL (status=$rc)"
+    curl -fsS -o /dev/null --max-time 30 --retry 3 \
+        --data-urlencode "status=$rc" \
+        --data-urlencode "host=$(hostname)" \
+        --data-urlencode "timestamp=${TIMESTAMP:-}" \
+        --data-urlencode "started_at=$STARTED_AT" \
+        --data-urlencode "finished_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        --data-urlencode "path=$path" \
+        --data-urlencode "archives=$archives" \
+        "$url" || warn "Completion ping failed"
+}
+trap 'on_exit $?' EXIT
 
 # --- Validate ----------------------------------------------------------------
 case "$DRIVER" in
@@ -425,7 +493,7 @@ backup_database() {
     local db="$1"
     local dest="${PRIMARY}/${TIMESTAMP}/${db}.sql.gz"
     local -a st
-    local bytes human
+    local bytes human stage=""
 
     if [[ "$DRY_RUN" == 1 ]]; then
         log "DRY RUN: would back up '$db' -> $dest"
@@ -441,16 +509,25 @@ backup_database() {
     set -e
 
     if [[ "${st[0]}" -ne 0 ]]; then
-        err "'$db': dump stage ($DUMP_BIN) failed (exit ${st[0]})"
-        FAILED=1; RESULT_LINES+=("$db  FAILED(dump)  -"); return 0
+        stage=dump;   err "'$db': dump stage ($DUMP_BIN) failed (exit ${st[0]})"
+    elif [[ "${st[1]}" -ne 0 ]]; then
+        stage=gzip;   err "'$db': gzip stage failed (exit ${st[1]})"
+    elif [[ "${st[2]}" -ne 0 ]]; then
+        stage=upload; err "'$db': upload stage (rclone rcat) failed (exit ${st[2]})"
     fi
-    if [[ "${st[1]}" -ne 0 ]]; then
-        err "'$db': gzip stage failed (exit ${st[1]})"
-        FAILED=1; RESULT_LINES+=("$db  FAILED(gzip)  -"); return 0
-    fi
-    if [[ "${st[2]}" -ne 0 ]]; then
-        err "'$db': upload stage (rclone rcat) failed (exit ${st[2]})"
-        FAILED=1; RESULT_LINES+=("$db  FAILED(upload)  -"); return 0
+
+    if [[ -n "$stage" ]]; then
+        # When the dump dies mid-way, gzip still closes a valid stream and
+        # rcat completes the upload, leaving a truncated file that looks like
+        # a good backup. Remove it (an upload failure leaves nothing behind).
+        if [[ "$stage" != upload ]]; then
+            rclone deletefile "${RCLONE_OPTS[@]}" "$dest" \
+                || warn "'$db': could not remove partial upload $dest"
+        fi
+        FAILED=1
+        RESULT_LINES+=("$db  FAILED($stage)  -")
+        ARCHIVES+=("{\"database\":$(json_str "$db"),\"status\":\"failed\",\"stage\":\"$stage\"}")
+        return 0
     fi
 
     bytes="$(rclone size --json "$dest" 2>/dev/null \
@@ -458,6 +535,7 @@ backup_database() {
     human="$(format_size "${bytes:-0}")"
     log "OK: '$db' ($human compressed)"
     RESULT_LINES+=("$db  OK  $human")
+    ARCHIVES+=("{\"database\":$(json_str "$db"),\"status\":\"ok\",\"bytes\":${bytes:-null}}")
     return 0
 }
 
@@ -481,7 +559,7 @@ ts_to_epoch() {
 prune_tiered() {
     local now cutoff_hourly cutoff_daily cutoff_monthly
     local -a folders valid to_delete
-    local entry ts epoch daykey monthkey filter_file
+    local entry ts epoch daykey monthkey
     local _raw _rc _erc _prc
     local kept_hourly=0 kept_daily=0 kept_monthly=0 deleted=0
     local -A day_max=() month_max=() zone_of=() epoch_of=()
@@ -590,19 +668,16 @@ prune_tiered() {
         done
         deleted=${#to_delete[@]}
     elif [[ ${#to_delete[@]} -gt 0 ]]; then
-        filter_file="$(mktemp)"
-        # Covers a kill/timeout while rclone is mid-run, not just normal
-        # completion -- mktemp's file is already 0600/owner-only, this just
-        # avoids leaving it behind if the process dies before the plain
-        # rm -f below runs.
-        trap 'rm -f "$filter_file"' EXIT
-        printf '%s/**\n' "${to_delete[@]}" > "$filter_file"
+        # on_exit also removes FILTER_FILE, covering a kill/timeout while
+        # rclone is mid-run, not just normal completion.
+        FILTER_FILE="$(mktemp)"
+        printf '%s/**\n' "${to_delete[@]}" > "$FILTER_FILE"
         set +e
-        rclone delete "$PRIMARY" --include-from "$filter_file" --rmdirs "${RCLONE_OPTS[@]}"
+        rclone delete "$PRIMARY" --include-from "$FILTER_FILE" --rmdirs "${RCLONE_OPTS[@]}"
         _prc=$?
         set -e
-        rm -f "$filter_file"
-        trap - EXIT
+        rm -f "$FILTER_FILE"
+        FILTER_FILE=""
         if [[ $_prc -ne 0 ]]; then
             err "Failed to purge ${#to_delete[@]} expired backup folder(s) (exit $_prc)"
             FAILED=1
@@ -625,7 +700,11 @@ for db in "${DB_LIST[@]}"; do
 done
 
 # --- Retention (prune primary first so the deletions propagate via sync) -----
-if [[ "$TIER_MODE" == 1 ]]; then
+# A failed run would otherwise count as the newest backup (tiered: the day's
+# keeper) and push older, complete backups out of the window.
+if [[ "$FAILED" -eq 1 ]]; then
+    warn "Skipping retention because a backup failed -- older backups are kept"
+elif [[ "$TIER_MODE" == 1 ]]; then
     if [[ -n "${CLI_RETENTION+x}" || -n "${RETENTION_DAYS+x}" ]]; then
         warn "Tiered retention active (--hourly/--daily/--monthly); ignoring --retention/RETENTION_DAYS ($RETENTION)"
     fi
