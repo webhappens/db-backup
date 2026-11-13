@@ -345,7 +345,7 @@ if [[ -n "$PING_URL" ]]; then
     command -v curl >/dev/null 2>&1 || die "curl not found in PATH (needed for --ping)"
 fi
 
-# shellcheck disable=SC2317  # invoked via trap
+# shellcheck disable=SC2317,SC2329  # invoked via trap
 on_exit() {
     local rc="$1" url path="" archives
     if [[ -n "$FILTER_FILE" ]]; then rm -f "$FILTER_FILE"; fi
