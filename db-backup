@@ -18,6 +18,13 @@
 
 set -eo pipefail
 
+VERSION=1.0.0
+
+# Hetzner Object Storage became a built-in S3 provider in 1.72.0. Distro
+# packages are often far older (Ubuntu 24.04 ships 1.60); install.sh installs
+# a current release.
+MIN_RCLONE=1.72.0
+
 # --- Defaults (lowest precedence: overridden by .env, then by CLI flags) -----
 DEFAULT_DRIVER=mysql
 DEFAULT_HOST=127.0.0.1
@@ -37,7 +44,7 @@ _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 log() {
     if [[ "$QUIET" == 1 ]]; then return 0; fi
-    local line="[$(_ts)] $*"
+    local line; line="[$(_ts)] $*"
     if [[ -n "${LOG:-}" ]]; then
         printf '%s\n' "$line" | tee -a "$LOG"
     else
@@ -46,7 +53,7 @@ log() {
 }
 
 err() {
-    local line="[$(_ts)] ERROR: $*"
+    local line; line="[$(_ts)] ERROR: $*"
     if [[ -n "${LOG:-}" ]]; then
         printf '%s\n' "$line" | tee -a "$LOG" >&2
     else
@@ -55,7 +62,7 @@ err() {
 }
 
 warn() {
-    local line="[$(_ts)] WARNING: $*"
+    local line; line="[$(_ts)] WARNING: $*"
     if [[ -n "${LOG:-}" ]]; then
         printf '%s\n' "$line" | tee -a "$LOG" >&2
     else
@@ -197,6 +204,7 @@ OUTPUT OPTIONS
 GENERAL OPTIONS
       --env <file>            Source a .env file (default: .env in current dir)
       --help                  Show help
+      --version               Show the version
 
 ENVIRONMENT VARIABLES (CLI flags always take precedence)
   DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES, DB_LOGIN_PATH,
@@ -236,11 +244,11 @@ RESTORE
 
 CRON
   # /etc/cron.d/db-backup -- flat retention, one daily run:
-  0 2 * * * forge /usr/local/bin/db-backup --env /etc/backup/production.env --log /var/log/backup.log
+  0 2 * * * forge /usr/local/bin/db-backup --env /home/forge/db-backup.env --log /home/forge/db-backup.log
 
   # Tiered retention needs only ONE schedule too -- hourly is enough, since
   # prune_tiered itself thins older backups down to daily/monthly granularity:
-  0 * * * * forge /usr/local/bin/db-backup --env /etc/backup/production.env --log /var/log/backup.log --hourly 48 --daily 14 --monthly 6
+  0 * * * * forge /usr/local/bin/db-backup --env /home/forge/db-backup.env --log /home/forge/db-backup.log --hourly 48 --daily 14 --monthly 6
 EOF
 }
 
@@ -272,6 +280,7 @@ while [[ $# -gt 0 ]]; do
         -q|--quiet)      QUIET=1;   shift ;;
         -v|--verbose)    VERBOSE=1; shift ;;
         --help)          show_help; exit 0 ;;
+        --version)       echo "db-backup $VERSION"; exit 0 ;;
         --)              shift; break ;;
         -*)              die "Unknown option: '$1' (try --help)" ;;
         *)               die "Unexpected argument: '$1' (try --help)" ;;
@@ -283,9 +292,15 @@ done
 # below so CLI always wins over env vars, which win over defaults.
 if [[ -n "${ENV_FILE:-}" ]]; then
     [[ -f "$ENV_FILE" ]] || die "Env file not found: $ENV_FILE"
-    set -a; . "$ENV_FILE"; set +a
+    set -a
+    # shellcheck source=/dev/null
+    . "$ENV_FILE"
+    set +a
 elif [[ -f "$PWD/.env" ]]; then
-    set -a; . "$PWD/.env"; set +a
+    set -a
+    # shellcheck source=/dev/null
+    . "$PWD/.env"
+    set +a
 fi
 
 # --- Resolve configuration (CLI > env > default) -----------------------------
@@ -408,7 +423,10 @@ if [[ "$TIER_MODE" == 1 && "$HOURLY" -eq 0 && "$DAILY" -eq 0 && "$MONTHLY" -eq 0
     die "Tiered retention active but --hourly/--daily/--monthly are all 0 (unlike --retention 0, this would delete every backup, including the one just made)"
 fi
 
-command -v rclone     >/dev/null 2>&1 || die "rclone not found in PATH"
+command -v rclone     >/dev/null 2>&1 || die "rclone not found in PATH (install.sh installs it)"
+RCLONE_VERSION="$(rclone version 2>/dev/null | awk 'NR==1 {sub(/^v/, "", $2); print $2}')"
+[[ "$(printf '%s\n' "$MIN_RCLONE" "$RCLONE_VERSION" | sort -V | head -n1)" == "$MIN_RCLONE" ]] \
+    || die "rclone ${RCLONE_VERSION:-(unknown version)} is too old; $MIN_RCLONE or later is required (re-run install.sh to upgrade)"
 command -v gzip       >/dev/null 2>&1 || die "gzip not found in PATH"
 command -v "$DUMP_BIN" >/dev/null 2>&1 || die "$DUMP_BIN not found in PATH"
 
