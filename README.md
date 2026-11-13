@@ -57,13 +57,21 @@ As the user that will run the backups (e.g. `forge`):
 
 ## Monitoring
 
-With `--ping <url>` (or `PING_URL`), every run POSTs its outcome to the URL,
-including runs that fail before any backup starts. `{status}` in the URL is
-replaced with the exit code, which suits [healthchecks.io](https://healthchecks.io)
-style checks: set the check's schedule to match the cron, and it also alerts
-when a run never happens. The form fields are `status`, `host`, `timestamp`,
-`started_at`, `finished_at`, `path` and `archives` (a JSON array with each
-database's size, or the stage that failed).
+Three options POST the outcome of a run to a URL, and can be combined:
+
+| Option | Env var | Sends |
+| ------ | ------- | ----- |
+| `--ping <url>` | `PING_URL` | On every exit, including runs that fail before any backup starts |
+| `--ping-success <url>` | `PING_SUCCESS_URL` | Only when the run succeeds (exit 0) |
+| `--ping-failure <url>` | `PING_FAILURE_URL` | Only when the run fails |
+
+A monitor that treats any request as healthy, such as a Laravel Forge
+heartbeat, needs `--ping-success`: it then alerts on failed runs as well as
+missing ones. `{status}` in a URL is replaced with the exit code, which suits
+[healthchecks.io](https://healthchecks.io) style checks with `--ping`. The form
+fields are `status`, `host`, `timestamp`, `started_at`, `finished_at`, `path`
+and `archives` (a JSON array with each database's size, or the stage that
+failed).
 
 A failed run never deletes older backups: retention is skipped, and a dump
 that dies part-way has its truncated file removed.

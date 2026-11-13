@@ -18,7 +18,7 @@
 
 set -eo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 # Hetzner Object Storage became a built-in S3 provider in 1.72.0. Distro
 # packages are often far older (Ubuntu 24.04 ships 1.60); install.sh installs
@@ -187,13 +187,14 @@ RETENTION OPTIONS
   never causes older good backups to be deleted.
 
 MONITORING OPTIONS
-  --ping <url>                POST the outcome to <url> on every exit,
-                              including failures. "{status}" in the URL is
-                              replaced with the exit code (0 = success), e.g.
-                              https://hc-ping.com/<uuid>/{status}
-                              Form fields: status, host, timestamp, started_at,
-                              finished_at, path, archives (JSON array of
-                              {database, status, bytes|stage}).
+  Each POSTs the outcome of the run to <url>; they can be combined.
+  --ping <url>                On every exit, including failures.
+  --ping-success <url>        Only when the run succeeds (exit 0).
+  --ping-failure <url>        Only when the run fails (non-zero exit).
+  "{status}" in a URL is replaced with the exit code (0 = success), e.g.
+  https://hc-ping.com/<uuid>/{status}. Form fields: status, host, timestamp,
+  started_at, finished_at, path, archives (JSON array of
+  {database, status, bytes|stage}).
 
 OUTPUT OPTIONS
   -l, --log <file>            Append to log file in addition to stdout
@@ -209,7 +210,8 @@ GENERAL OPTIONS
 ENVIRONMENT VARIABLES (CLI flags always take precedence)
   DB_DRIVER, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAMES, DB_LOGIN_PATH,
   DB_SERVICE, RCLONE_PRIMARY, RCLONE_SECONDARY, RETENTION_DAYS,
-  RETENTION_HOURLY, RETENTION_DAILY, RETENTION_MONTHLY, LOG_FILE, PING_URL
+  RETENTION_HOURLY, RETENTION_DAILY, RETENTION_MONTHLY, LOG_FILE, PING_URL,
+  PING_SUCCESS_URL, PING_FAILURE_URL
   (pgsql also honours the standard PGSERVICE variable. Setting any of
   RETENTION_HOURLY/RETENTION_DAILY/RETENTION_MONTHLY switches to tiered
   retention; see RETENTION OPTIONS above.)
@@ -275,6 +277,8 @@ while [[ $# -gt 0 ]]; do
         --monthly)       need "$1" $#; CLI_MONTHLY="$2";     shift 2 ;;
         -l|--log)        need "$1" $#; CLI_LOG="$2";        shift 2 ;;
         --ping)          need "$1" $#; CLI_PING="$2";       shift 2 ;;
+        --ping-success)  need "$1" $#; CLI_PING_SUCCESS="$2"; shift 2 ;;
+        --ping-failure)  need "$1" $#; CLI_PING_FAILURE="$2"; shift 2 ;;
         --env)           need "$1" $#; ENV_FILE="$2";       shift 2 ;;
         -n|--dry-run)    DRY_RUN=1; shift ;;
         -q|--quiet)      QUIET=1;   shift ;;
@@ -324,6 +328,8 @@ SECONDARY="${CLI_SECONDARY:-${RCLONE_SECONDARY:-}}"
 RETENTION="${CLI_RETENTION:-${RETENTION_DAYS:-$DEFAULT_RETENTION}}"
 LOG="${CLI_LOG:-${LOG_FILE:-}}"
 PING_URL="${CLI_PING:-${PING_URL:-}}"
+PING_SUCCESS_URL="${CLI_PING_SUCCESS:-${PING_SUCCESS_URL:-}}"
+PING_FAILURE_URL="${CLI_PING_FAILURE:-${PING_FAILURE_URL:-}}"
 
 # Tiered ("grandfather-father-son") retention. Presence (not value) of any of
 # these three -- flag or env var, even set to 0 -- switches into tiered mode,
@@ -337,26 +343,30 @@ HOURLY="${CLI_HOURLY:-${RETENTION_HOURLY:-0}}"
 DAILY="${CLI_DAILY:-${RETENTION_DAILY:-0}}"
 MONTHLY="${CLI_MONTHLY:-${RETENTION_MONTHLY:-0}}"
 
-# --- Exit handler: cleanup + completion ping ---------------------------------
-# Runs on every exit -- success, die(), or an unexpected error -- so the ping
-# always reports the outcome (the same approach as Forge's backup.sh). Must not
+# --- Exit handler: cleanup + completion pings --------------------------------
+# Runs on every exit -- success, die(), or an unexpected error -- so the pings
+# always report the outcome (the same approach as Forge's backup.sh). Must not
 # call exit or let a command fail, or it would change the script's exit code.
-if [[ -n "$PING_URL" ]]; then
-    command -v curl >/dev/null 2>&1 || die "curl not found in PATH (needed for --ping)"
+if [[ -n "$PING_URL$PING_SUCCESS_URL$PING_FAILURE_URL" ]]; then
+    command -v curl >/dev/null 2>&1 || die "curl not found in PATH (needed for --ping*)"
 fi
 
 # shellcheck disable=SC2317,SC2329  # invoked via trap
 on_exit() {
-    local rc="$1" url path="" archives
+    local rc="$1" url path="" archives finished
+    local -a urls=()
     if [[ -n "$FILTER_FILE" ]]; then rm -f "$FILTER_FILE"; fi
-    [[ -n "$PING_URL" ]] || return 0
+
+    if [[ -n "$PING_URL" ]]; then urls+=("$PING_URL"); fi
+    if [[ "$rc" -eq 0 && -n "$PING_SUCCESS_URL" ]]; then urls+=("$PING_SUCCESS_URL"); fi
+    if [[ "$rc" -ne 0 && -n "$PING_FAILURE_URL" ]]; then urls+=("$PING_FAILURE_URL"); fi
+    [[ ${#urls[@]} -gt 0 ]] || return 0
 
     if [[ "$DRY_RUN" == 1 ]]; then
-        log "DRY RUN: would ping completion URL (status=$rc)"
+        log "DRY RUN: would send ${#urls[@]} ping(s) (status=$rc)"
         return 0
     fi
 
-    url="${PING_URL//\{status\}/$rc}"
     if [[ -n "${TIMESTAMP:-}" ]]; then
         path="${PRIMARY}/${TIMESTAMP}"
         # A connection-string remote (":s3,secret_access_key=...:bucket") can
@@ -364,17 +374,20 @@ on_exit() {
         if [[ "$path" == *,* ]]; then path="${path##*:}"; fi
     fi
     archives="$(IFS=,; printf '[%s]' "${ARCHIVES[*]}")"
+    finished="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-    log "Pinging completion URL (status=$rc)"
-    curl -fsS -o /dev/null --max-time 30 --retry 3 \
-        --data-urlencode "status=$rc" \
-        --data-urlencode "host=$(hostname)" \
-        --data-urlencode "timestamp=${TIMESTAMP:-}" \
-        --data-urlencode "started_at=$STARTED_AT" \
-        --data-urlencode "finished_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        --data-urlencode "path=$path" \
-        --data-urlencode "archives=$archives" \
-        "$url" || warn "Completion ping failed"
+    log "Sending ${#urls[@]} ping(s) (status=$rc)"
+    for url in "${urls[@]}"; do
+        curl -fsS -o /dev/null --max-time 30 --retry 3 \
+            --data-urlencode "status=$rc" \
+            --data-urlencode "host=$(hostname)" \
+            --data-urlencode "timestamp=${TIMESTAMP:-}" \
+            --data-urlencode "started_at=$STARTED_AT" \
+            --data-urlencode "finished_at=$finished" \
+            --data-urlencode "path=$path" \
+            --data-urlencode "archives=$archives" \
+            "${url//\{status\}/$rc}" || warn "Ping failed"
+    done
 }
 trap 'on_exit $?' EXIT
 
