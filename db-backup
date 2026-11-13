@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# db-backup — stream database backups directly to object storage via rclone.
+# db-backup -- stream database backups directly to object storage via rclone.
 #
 # Each database is dumped, gzipped, and uploaded in a single pipeline with no
 # temporary files at any point:
@@ -146,7 +146,7 @@ is_system_db() {
 # --- Help --------------------------------------------------------------------
 show_help() {
     cat <<'EOF'
-db-backup — stream database backups directly to object storage via rclone.
+db-backup -- stream database backups directly to object storage via rclone.
 
 USAGE
   db-backup [OPTIONS]
@@ -435,7 +435,7 @@ if [[ -n "$SECONDARY" ]]; then SECONDARY="${SECONDARY%/}"; fi
 
 # --- Build per-driver connection args + password env -------------------------
 # With --login-path (mysql/mariadb) or --service (pgsql) the credentials live in
-# the client's own named store (~/.mylogin.cnf, ~/.pg_service.conf + ~/.pgpass) —
+# the client's own named store (~/.mylogin.cnf, ~/.pg_service.conf + ~/.pgpass) --
 # the rclone-remote equivalent. Explicit --host/--port/--user still override.
 MYSQL_ARGS=()
 PG_CONN=()
@@ -758,7 +758,7 @@ if [[ -n "$SECONDARY" ]]; then
         _src=$?
         set -e
         if [[ $_src -ne 0 ]]; then
-            warn "Secondary sync failed (exit $_src) — primary backup unaffected"
+            warn "Secondary sync failed (exit $_src) -- primary backup unaffected"
         else
             log "Secondary sync complete"
         fi

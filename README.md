@@ -84,6 +84,15 @@ A complete dump ends with `-- Dump completed on ...` (MySQL/MariaDB) or
 `-- PostgreSQL database dump complete`, so `rclone cat ... | gunzip | tail -n1`
 checks a backup without restoring it.
 
+## Development
+
+Lint both scripts with [ShellCheck](https://www.shellcheck.net) before
+committing, as CI does (`brew install shellcheck`):
+
+```bash
+shellcheck db-backup install.sh
+```
+
 ## Releasing
 
 1. Update `VERSION` in `db-backup` and commit.
