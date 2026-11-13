@@ -4,7 +4,12 @@
 #   curl -fsSL https://raw.githubusercontent.com/webhappens/db-backup/main/install.sh | sudo bash
 #   curl -fsSL ... | sudo bash -s -- --version v1.0.0
 #
-# db-backup goes to /usr/local/bin. rclone is installed from rclone.org when
+# db-backup goes to /usr/local/bin. A first install takes the latest release.
+# Re-running upgrades to the latest release with the installed major version,
+# so it is safe to schedule; a new major version is only reported, since it
+# may need changes to existing jobs. --version installs exactly that release.
+#
+# rclone is installed from rclone.org when
 # it is missing or older than db-backup's MIN_RCLONE: as a .deb or .rpm where
 # the system uses one, otherwise the plain binary in /usr/bin (on cron's
 # default PATH, like the packages). A new enough rclone is left alone.
@@ -17,7 +22,9 @@ REPO=webhappens/db-backup
 RAW_BASE="${DB_BACKUP_RAW_BASE:-https://raw.githubusercontent.com/$REPO}"
 RCLONE_VERSION=1.76.0  # installed when rclone is missing or too old
 
-VERSION=""  # db-backup release tag or git ref; empty = latest release
+INSTALLED=/usr/local/bin/db-backup
+
+VERSION=""  # db-backup release tag or git ref; empty = pick a release
 
 log() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -28,13 +35,32 @@ version_gte() { [[ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]];
 
 rclone_version() { rclone version 2>/dev/null | awk 'NR==1 {sub(/^v/, "", $2); print $2}'; }
 
+# Newest release tag: github.com/<repo>/releases/latest redirects to
+# .../releases/tag/<tag>.
+latest_release() {
+    local url
+    url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+    [[ "$url" == */releases/tag/* ]] && printf '%s\n' "${url##*/}"
+}
+
+# Newest release tag with major version $1, from the GitHub API (60 requests
+# an hour per IP without a token). Only plain vX.Y.Z tags count.
+latest_release_in_major() {
+    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=100" \
+        | grep -oE '"tag_name": *"v[0-9]+\.[0-9]+\.[0-9]+"' \
+        | grep -oE "v$1\.[0-9]+\.[0-9]+" \
+        | sort -V | tail -n1
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)
             [[ $# -ge 2 ]] || die "--version requires a value"
             VERSION="$2"; shift 2 ;;
         --help)
-            log "Usage: install.sh [--version <tag>]   (default: latest release)"
+            log "Usage: install.sh [--version <tag>]"
+            log "Without --version: the latest release on a first install, then the"
+            log "latest release with the installed major version."
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -55,34 +81,59 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # --- db-backup ---------------------------------------------------------------
-if [[ -z "$VERSION" ]]; then
-    # github.com/<repo>/releases/latest redirects to .../releases/tag/<tag>.
-    latest="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" || true)"
-    VERSION="${latest##*/}"
-    [[ "$latest" == */releases/tag/* && -n "$VERSION" ]] \
-        || die "Could not find the latest db-backup release (pass --version <tag>)"
-fi
-
-log "Downloading db-backup $VERSION"
-curl -fsSL "$RAW_BASE/$VERSION/db-backup" -o "$TMP/db-backup" \
-    || die "Could not download db-backup $VERSION"
-if ! { grep -q "^VERSION=" "$TMP/db-backup" && bash -n "$TMP/db-backup"; }; then
-    die "The downloaded db-backup is not a valid script"
-fi
-
-new_version="$(sed -n 's/^VERSION=//p' "$TMP/db-backup")"
-min_rclone="$(sed -n 's/^MIN_RCLONE=//p' "$TMP/db-backup")"
+# An installed copy without a plain X.Y.Z version (e.g. one copied by hand
+# before --version existed) is treated as a first install.
 old_version=""
-if [[ -x /usr/local/bin/db-backup ]]; then
-    old_version="$(/usr/local/bin/db-backup --version 2>/dev/null | awk '{print $2}' || true)"
+if [[ -x "$INSTALLED" ]]; then
+    old_version="$("$INSTALLED" --version 2>/dev/null | awk '{print $2}' || true)"
+    [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || old_version=""
 fi
 
-install -m 0755 "$TMP/db-backup" /usr/local/bin/db-backup
-if [[ -n "$old_version" && "$old_version" != "$new_version" ]]; then
-    log "Upgraded db-backup $old_version -> $new_version"
-else
-    log "Installed db-backup $new_version at /usr/local/bin/db-backup"
+up_to_date=0
+newer_major=""
+if [[ -z "$VERSION" ]]; then
+    latest="$(latest_release || true)"
+    [[ -n "$latest" ]] || die "Could not find the latest db-backup release (pass --version <tag>)"
+    VERSION="$latest"
+
+    if [[ -n "$old_version" ]]; then
+        latest_major="${latest#v}"; latest_major="${latest_major%%.*}"
+        old_major="${old_version%%.*}"
+        if (( latest_major > old_major )); then
+            newer_major="$latest"
+            VERSION="$(latest_release_in_major "$old_major" || true)"
+        fi
+        # Nothing to do when already on that release, or on a newer one
+        # installed from a branch or tag with --version.
+        if [[ -z "$VERSION" ]] || version_gte "$old_version" "${VERSION#v}"; then
+            up_to_date=1
+        fi
+    fi
 fi
+
+if [[ "$up_to_date" == 1 && -n "$newer_major" ]]; then
+    log "db-backup $old_version is the latest ${old_version%%.*}.x release"
+elif [[ "$up_to_date" == 1 ]]; then
+    log "db-backup $old_version is up to date"
+else
+    log "Downloading db-backup $VERSION"
+    curl -fsSL "$RAW_BASE/$VERSION/db-backup" -o "$TMP/db-backup" \
+        || die "Could not download db-backup $VERSION"
+    if ! { grep -q "^VERSION=" "$TMP/db-backup" && bash -n "$TMP/db-backup"; }; then
+        die "The downloaded db-backup is not a valid script"
+    fi
+
+    new_version="$(sed -n 's/^VERSION=//p' "$TMP/db-backup")"
+    install -m 0755 "$TMP/db-backup" "$INSTALLED"
+    if [[ -z "$old_version" || "$old_version" == "$new_version" ]]; then
+        log "Installed db-backup $new_version at $INSTALLED"
+    elif version_gte "$new_version" "$old_version"; then
+        log "Upgraded db-backup $old_version -> $new_version"
+    else
+        log "Downgraded db-backup $old_version -> $new_version"
+    fi
+fi
+min_rclone="$(sed -n 's/^MIN_RCLONE=//p' "$INSTALLED")"
 
 # --- rclone ------------------------------------------------------------------
 current=""
@@ -139,6 +190,14 @@ if [[ -n "$found" ]]; then
 else
     warn "No mysqldump, mariadb-dump or pg_dump found; install the one matching your database server"
 fi
+
+if [[ -n "$newer_major" ]]; then
+    log "db-backup $newer_major is available. A new major version may need changes"
+    log "to existing jobs: read its release notes, then rerun with --version $newer_major"
+fi
+
+# Setup steps on a first install only, so scheduled runs stay short.
+[[ -z "$old_version" ]] || exit 0
 
 cat <<'EOF'
 

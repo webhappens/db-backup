@@ -22,9 +22,26 @@ curl -fsSL https://raw.githubusercontent.com/webhappens/db-backup/main/install.s
 This installs the latest release to `/usr/local/bin/db-backup`. If rclone is
 missing or too old, it also installs a current rclone from rclone.org (as a
 `.deb` or `.rpm` where the system uses one), checked against rclone's
-published checksums. Pin a release with `sudo bash -s -- --version v1.0.0`.
+published checksums. Install a specific release with
+`sudo bash -s -- --version v1.0.0`.
 
-Run the same command again to upgrade.
+### Upgrading
+
+Run the same command again. It upgrades to the latest release with the
+installed major version, so a server on 1.x only moves to newer 1.x releases.
+A new major version can need changes to existing jobs, so the installer only
+reports it; read its release notes, then install it with `--version`.
+
+That makes upgrades safe to schedule, e.g. as a weekly Forge scheduled job
+run as root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/webhappens/db-backup/main/install.sh | bash
+```
+
+A scheduled upgrade runs whatever is on `main` as root on every server that
+has it, so keep `main` protected (changes through pull requests, no force
+pushes).
 
 ## Set up
 
@@ -106,5 +123,13 @@ shellcheck db-backup install.sh
 1. Update `VERSION` in `db-backup` and commit.
 2. Tag and release: `gh release create v1.2.3 --generate-notes`
 
+Versions follow [semver](https://semver.org), and scheduled upgrades rely on
+it. Bump the **major** version for any change that makes an existing command
+line, env file or bucket layout behave differently (a removed or renamed
+option, a changed default, retention that would keep or delete different
+backups), and say what to change in the release notes. New options and fixes
+are minor and patch releases.
+
 CI checks both scripts with shellcheck, and that a release tag matches
-`VERSION`. The installer installs the latest GitHub release.
+`VERSION`. `install.sh` runs straight from `main`, so changes to it take
+effect without a release.
